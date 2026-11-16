@@ -1,0 +1,35 @@
+tpick — pick one or more items from a list, with an optional live fzf preview.
+Copyright (C) the tpick authors.
+
+This program is free software; you can redistribute it and/or modify it
+under the terms of either of the following licenses, at your option:
+
+  1. The GNU General Public License, version 3 or later, as published by the
+     Free Software Foundation — https://www.gnu.org/licenses/gpl-3.0.html
+
+  2. The Artistic License 2.0 — https://opensource.org/licenses/Artistic-2.0
+
+You may use, modify, and distribute tpick under the terms of either
+license, at your option.  Selecting one license relieves you of the
+obligations imposed by the other.
+
+SPDX-License-Identifier: GPL-3.0-or-later OR Artistic-2.0
+
+---------------------------------------------------------------------------
+
+This program is distributed in the hope that it will be useful, but WITHOUT
+ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+FOR A PARTICULAR PURPOSE.  See the GNU General Public License and the
+Artistic License 2.0 for the full terms and conditions.
+
+The complete, canonical text of each license is available online:
+
+  * GNU General Public License v3.0:
+    https://www.gnu.org/licenses/gpl-3.0.txt
+
+  * Artistic License 2.0:
+    https://opensource.org/licenses/Artistic-2.0
+
+A copy of each license should accompany this distribution.  If it did not,
+write to the Free Software Foundation, Inc., 51 Franklin Street, Fifth Floor,
+Boston, MA 02110-1301 USA, or visit the URLs above.

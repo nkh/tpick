@@ -1,0 +1,215 @@
+#!/usr/bin/env bash
+# tpick — pick one or more items, with an optional live fzf preview.
+#
+# A small, dependency-light picker reusable beyond tmux. Items are read from
+# stdin (the Unix-idiomatic default) or from an ITEMS_FILE, and the selected
+# line(s) are written to stdout, one per line — the WHOLE line, exactly as fed
+# in (a bare "key" line is normalized to "key<TAB>key" so it has a display
+# column). tpick is field-agnostic: it does not decide which field is
+# "the key". By convention the first TAB field is the key and the rest is
+# display/preview data, but the caller extracts whatever it needs from the
+# returned line — tpick never strips a field for the caller.
+#
+# An item may carry more than two TAB-separated fields:
+#   key<TAB>display<TAB>extra...
+# fzf shows the fields from the second onward (--with-nth, set by --nth,
+# default "2.."); the preview template may reference any field as {1}, {2},
+# {3}, … (TAB is the delimiter); and the full line comes back on stdout.
+#
+# Uses fzf when available — and only fzf: a cancel (Esc/Ctrl-C) exits
+# immediately and never falls through to the numbered list. With fzf, --preview
+# renders each candidate; the template may use {1}, {2}, {3}, … for the item's
+# first, second, third, … TAB-delimited fields. With --multi, several items may
+# be selected. When fzf is absent — or refused with --no-fzf — a numbered-list
+# fallback reads a single choice: it prints "N) display" lines to stderr and
+# reads the number from stdin (file mode) or from the terminal (/dev/tty, pipe
+# mode). The fallback is itself interactive: it needs a terminal to show the
+# list and receive the number, OR a stdin that can deliver the choice (file
+# mode); with neither it exits 1 — there is no way to "choose" with no input at
+# all. (--multi/--popup/forwarded fzf options are unsupported there.)
+#
+# Usage:
+#   tpick [--prompt STR] [--preview TMPL] [--multi] [--header STR]
+#               [--nth FIELDSET] [--popup] [--no-fzf] [FZF_OPTS...] [ITEMS_FILE]
+#     ... | tpick [opts]           # read items from stdin (preferred)
+#     tpick [opts] -               # read items from stdin (explicit)
+#     tpick [opts] ITEMS_FILE      # read items from a file (back-compat)
+#
+#   --nth FIELDSET  which TAB fields fzf displays, in fzf --with-nth syntax
+#                  (default "2..": every field from the second onward). "1,2"
+#                  shows the key alongside the display, "2,3" shows two columns,
+#                  and so on. Extra fields are always reachable in the preview
+#                  as {3}, {4}, … regardless of --nth. Ignored by the
+#                  numbered-list fallback (which always shows fields 2..end).
+#   --popup floats the picker in a tmux popup (via `fzf-tmux -p`) when run
+#   inside a tmux session that has fzf-tmux; otherwise it warns and falls back
+#   to inline fzf. It needs fzf (the numbered-list fallback can't serve it).
+#   --no-fzf refuses fzf even when installed, forcing the numbered-list fallback
+#   (handy if fzf misbehaves, or you simply want the plain list). The fallback
+#   can't serve --multi, --popup, or forwarded fzf options, so those exit 2
+#   under --no-fzf exactly as they do when fzf is genuinely absent.
+#
+#   Any other --option is forwarded to fzf verbatim when fzf is available
+#   (e.g. --reverse, --cycle, --border, --height=10, --pointer=▶). With fzf
+#   absent they are rejected. Options that take a value must use the
+#   --opt=value form, so the items file is unambiguously the first bare argument.
+#
+# Exit codes:
+#   0  selection made (stdout non-empty)
+#   1  cancelled, or no items
+#   2  bad usage, --multi/--popup/extra options without fzf (absent or --no-fzf),
+#      or no items on a TTY
+#
+# Examples:
+#   printf 'a\talpha\nb\tbeta\n' | tpick --prompt "pick"
+#   tmux list-panes -a -F '#{pane_id}\t...' | tpick --preview 'tmux capture-pane -p -t {1}'
+#   tpick --multi --preview 'cat {1}.txt' items.txt   # mark several
+#   tmux list-panes -a -F '#{pane_id}\t...' | tpick --popup --preview 'tmux capture-pane -p -t {1}'
+#   # three fields — key / two-column display / a preview-only note (field 3):
+#   printf 'v1.2.3\trelease 1.2.3\ttagged 2024-01-15\nv1.3.0\trelease 1.3.0\ttagged 2024-03-20\n' \
+#     | tpick --nth 2,3 --preview 'echo {1} was {3}'
+
+set -uo pipefail
+
+prompt="select"
+preview=""
+multi=0
+header=""
+nth="2.."          # which TAB fields fzf displays (fzf --with-nth syntax)
+items=""
+popup=0
+no_fzf=0          # --no-fzf: force the numbered-list fallback, refuse fzf
+extra=()          # unrecognized options, forwarded to fzf when available
+
+usage() {
+  sed -n '2,/^$/p' "$0" 2>/dev/null | sed 's/^# \{0,1\}//'
+  exit "${1:-0}"
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --prompt)  prompt="$2";  shift 2 ;;
+    --preview) preview="$2"; shift 2 ;;
+    --header)  header="$2";  shift 2 ;;
+    --nth)     nth="$2";     shift 2 ;;
+    --multi)   multi=1; shift ;;
+    --popup)   popup=1; shift ;;
+    --no-fzf)  no_fzf=1; shift ;;
+    -h|--help) usage 0 ;;
+    --) shift; [[ $# -gt 0 ]] && items="$1"; shift ;;
+    -)  items="-"; shift ;;   # explicit "read items from stdin"
+    -*) extra+=("$1"); shift ;;   # unrecognized -option : forward to fzf verbatim
+    *)  items="$1"; shift ;;
+  esac
+done
+
+# Items source: stdin when no ITEMS_FILE is given (or "-"), else the named
+# file. Reading from a pipe is the default; the file argument is kept for
+# callers that already have the list on disk. If stdin is a terminal (nothing
+# was piped) we refuse rather than hang.
+if [[ -z "$items" || "$items" == "-" ]]; then
+  if [[ -t 0 ]]; then
+    echo "tpick: no items on stdin — pipe a list in, or pass ITEMS_FILE (try --help)" >&2
+    exit 2
+  fi
+  items_src=/dev/stdin
+else
+  [[ -f "$items" ]] || { echo "tpick: items file not found: $items" >&2; exit 2; }
+  items_src="$items"
+fi
+
+# normalize: a bare line (no TAB) is duplicated to "key<TAB>key" so every line
+# has a display column (field 2) for fzf's --with-nth and for the numbered-list
+# fallback. Lines that already contain a TAB — including ones with more than
+# two fields — pass through unchanged. The whole (normalized) line is what
+# comes back on stdout; the caller extracts the key if it needs one.
+norm="$(mktemp)"
+# Remove the temp file on any normal exit or interrupt. The signal traps must
+# exit explicitly: bash runs a trap during a blocking builtin (read) but then
+# *resumes* it, so without `exit` a SIGTERM while waiting for input would run
+# cleanup and then hang again. Exit codes are 128+signal (the Unix convention).
+# shellcheck disable=SC2329  # cleanup() is invoked via the traps below
+cleanup() { rm -f "$norm"; }
+trap cleanup EXIT
+trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 143' TERM
+trap 'cleanup; exit 129' HUP
+while IFS= read -r line || [[ -n "$line" ]]; do
+  [[ -z "$line" ]] && continue
+  if [[ "$line" == *$'\t'* ]]; then printf '%s\n' "$line" >> "$norm"
+  else printf '%s\t%s\n' "$line" "$line" >> "$norm"; fi
+done < "$items_src"
+
+# fzf is used only when available AND not refused via --no-fzf. --no-fzf forces
+# the numbered-list fallback even on a machine that has fzf installed.
+if [[ "$no_fzf" -eq 0 ]] && command -v fzf >/dev/null 2>&1; then
+  fzf_args=(--prompt="$prompt > " --delimiter=$'\t' --with-nth "$nth" --no-info)
+  [[ -n "$preview" ]] && fzf_args+=(--preview "$preview" --preview-window right:60%:wrap)
+  [[ "$multi" -eq 1 ]] && fzf_args+=(--multi)
+  [[ -n "$header" ]]  && fzf_args+=(--header "$header")
+  # --popup floats the picker in a tmux popup via `fzf-tmux -p`. It needs a tmux
+  # session ($TMUX) and the fzf-tmux helper; otherwise warn and use inline fzf.
+  if [[ "$popup" -eq 1 ]]; then
+    if [[ -z "${TMUX:-}" ]]; then
+      echo "tpick: --popup needs a tmux session; using inline fzf" >&2
+      launcher=(fzf)
+    elif ! command -v fzf-tmux >/dev/null 2>&1; then
+      echo "tpick: --popup needs fzf-tmux (not found); using inline fzf" >&2
+      launcher=(fzf)
+    else
+      launcher=(fzf-tmux -p --)
+    fi
+  else
+    launcher=(fzf)
+  fi
+  if sel="$("${launcher[@]}" "${fzf_args[@]}" "${extra[@]}" < "$norm" 2>/dev/null)"; then
+    [[ -z "$sel" ]] && exit 1
+    printf '%s\n' "$sel"                      # the whole selected line(s)
+    exit 0
+  fi
+  # fzf is available but returned non-zero (the user cancelled with Esc/Ctrl-C,
+  # or it could not grab the terminal). Do NOT fall back to the numbered list:
+  # the picker was already shown via fzf, so a cancel means "stop", not "retry
+  # in a different UI". Exit cancelled.
+  exit 1
+fi
+
+# No fzf usable (absent, or refused via --no-fzf): serve single-select via the
+# numbered-list fallback. (--multi, --popup, and any forwarded fzf options
+# can't be served here.)
+if [[ "$multi" -eq 1 ]]; then
+  echo "tpick: --multi requires fzf (not available, or disabled by --no-fzf)" >&2; exit 2
+fi
+if [[ "$popup" -eq 1 ]]; then
+  echo "tpick: --popup requires fzf (not available, or disabled by --no-fzf)" >&2; exit 2
+fi
+if [[ "${#extra[@]}" -gt 0 ]]; then
+  echo "tpick: extra options require fzf (not available, or disabled by --no-fzf): ${extra[*]}" >&2; exit 2
+fi
+
+n=0
+lines=()
+while IFS= read -r line || [[ -n "$line" ]]; do
+  [[ -z "$line" ]] && continue
+  n=$((n+1)); lines+=("$line")
+  printf '%d) %s\n' "$n" "${line#*$'\t'}" >&2   # show fields 2..end (the display)
+done < "$norm"
+[[ $n -eq 0 ]] && exit 1
+printf '%s: ' "$prompt" >&2
+# When items came from a pipe, stdin is the items stream (already consumed);
+# read the numeric choice from the terminal instead. When items came from a
+# file, stdin is free and the choice is read from it (legacy/test behavior). If
+# pipe mode has no controlling terminal (/dev/tty), there is no way to receive a
+# choice — say so plainly rather than hang or exit silently.
+if [[ "$items_src" == "/dev/stdin" ]]; then
+  if ! read -r choice </dev/tty 2>/dev/null; then
+    echo "tpick: no terminal for the numbered-list fallback (need /dev/tty in pipe mode; install fzf, pass ITEMS_FILE, or run with a tty)" >&2
+    exit 1
+  fi
+else
+  read -r choice || exit 1
+fi
+if [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge 1 ]] && [[ "$choice" -le $n ]]; then
+  printf '%s\n' "${lines[$((choice-1))]}"; exit 0   # the whole selected line
+fi
+exit 1
