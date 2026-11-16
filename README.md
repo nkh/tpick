@@ -6,6 +6,12 @@ You can also display a preview when fzf is used.
 
 It reads *items* from stdin (or a file) and writes the **selected line(s)** to stdout.
 
+in fzf:
+![UI](https://github.com/nkh/tpick/blob/main/screenshots/ss1.png)
+
+in fallback mode:
+![UI](https://github.com/nkh/tpick/blob/main/screenshots/ss2.png)
+
 ## items format
 
 `text<TAB>text<TAB>...`
